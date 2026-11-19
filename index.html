@@ -568,6 +568,62 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
   }
   let state=load(), current='s26', history=[], panelKind=null, toastTimer, splashTimer, storageOK=true, returnFocus=null;
   let uid=0;
+  // Keep the current screen visible until every essential image for the next screen
+  // has loaded and decoded. This prevents the white flash between tab transitions.
+  let navigationToken=0;
+  const imagePreloadCache=new Map();
+  function preloadImageAsset(src){
+    if(!src)return Promise.resolve();
+    if(imagePreloadCache.has(src))return imagePreloadCache.get(src);
+    const image=new Image();
+    image.decoding='async';
+    try{image.fetchPriority='high';}catch{}
+    const promise=new Promise(resolve=>{
+      let settled=false;
+      const finish=()=>{
+        if(settled)return;settled=true;
+        if(typeof image.decode==='function')image.decode().catch(()=>{}).then(resolve);
+        else resolve();
+      };
+      image.addEventListener('load',finish,{once:true});
+      image.addEventListener('error',()=>{if(!settled){settled=true;resolve();}},{once:true});
+      image.src=src;
+      if(image.complete)finish();
+    });
+    imagePreloadCache.set(src,promise);
+    return promise;
+  }
+  function screenImageSources(id){
+    const urls=new Set();
+    const add=src=>{if(typeof src==='string'&&src)urls.add(src);};
+    const screen=map[id];
+    if(screen)add(screen.src);
+    const homeRef=D.homeReferences?.[id];
+    if(homeRef){
+      add(homeRef.templateSrc||screen?.src);
+      const parts=homeRef.parts||[{id,top:132,bottom:750}];
+      for(const part of parts){
+        const partScreen=map[part.id]||D.homeIndicatorReferences?.[part.id];
+        const partRef=D.homeReferences?.[part.id]||D.homeIndicatorReferences?.[part.id];
+        if(partScreen)add(partRef?.templateSrc||partScreen.src);
+        if(partRef?.graphIcon)add(D.progressIcons?.[partRef.graphIcon]?.src);
+      }
+      if(homeRef.graphIcon)add(D.progressIcons?.[homeRef.graphIcon]?.src);
+    }
+    const continuation=D.continuations?.[id];
+    if(continuation?.next)add(map[continuation.next]?.src);
+    if(id==='s29'||id==='s30'){add(map.s29?.src);add(map.s30?.src);}
+    // Exercise cards are separate image files, not crops of the base screen.
+    if(STARTS.includes(id)){
+      const profile=screen?.profile||state.profile;
+      for(const card of D.exerciseDecks?.[profile]||[])add(card.src);
+    }
+    // Summary tiles use small standalone icons.
+    if(['s37','s39','s41','s43'].includes(id))
+      for(const src of Object.values(D.summaryIcons||{}))add(src);
+    if(!['s23','s26','s34','s35'].includes(id))add(D.footer?.hdSrc);
+    return [...urls];
+  }
   function save(){rememberMedication();try{localStorage.setItem(KEY,JSON.stringify(state));storageOK=true;}catch{storageOK=false;}updateSummary();updateLive();}
   function message(text){const n=$('phone-toast');n.textContent=text;n.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>n.classList.remove('show'),2800);}
   function dateLabel(iso){return `${Number(iso.slice(5,7))}월 ${Number(iso.slice(8,10))}일`;}
@@ -580,16 +636,25 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
   function goto(id,opts={}){
     if(!map[id])return;
     clearTimeout(splashTimer);
-    if(opts.push!==false && current!==id){history.push({id:current,scroll:$('content-scroll')?.scrollTop||0});if(history.length>100)history.shift();}
-    current=id;
-    if(map[id].comboProfiles&&opts.adopt!==false)selectConditions(map[id].comboProfiles);
-    else if(map[id].profile && opts.adopt!==false && state.profile!==map[id].profile)setProfile(map[id].profile,selectedDiseaseProfiles().includes(map[id].profile));
+    const token=++navigationToken;
+    const fromId=current;
+    const fromScroll=$('content-scroll')?.scrollTop||0;
+    // Close any open sheet immediately, but do not remove the current screen.
     closePanel();
     $('inspector').classList.remove('open');
-    try{window.history.replaceState(null,'','#'+id);}catch{}
-    if(STARTS.includes(id))restoreExerciseState(state);
-    render(opts.scroll||0);save();
-    if(id==='s26')splashTimer=setTimeout(()=>{if(current==='s26')goto('s35',{push:false});},800);
+    (async()=>{
+      await Promise.all(screenImageSources(id).map(preloadImageAsset));
+      // A newer tap may have requested another screen while this one was loading.
+      if(token!==navigationToken)return;
+      if(opts.push!==false&&fromId!==id){history.push({id:fromId,scroll:fromScroll});if(history.length>100)history.shift();}
+      current=id;
+      if(map[id].comboProfiles&&opts.adopt!==false)selectConditions(map[id].comboProfiles);
+      else if(map[id].profile&&opts.adopt!==false&&state.profile!==map[id].profile)setProfile(map[id].profile,selectedDiseaseProfiles().includes(map[id].profile));
+      try{window.history.replaceState(null,'','#'+id);}catch{}
+      if(STARTS.includes(id))restoreExerciseState(state);
+      render(opts.scroll||0);save();
+      if(id==='s26')splashTimer=setTimeout(()=>{if(current==='s26')goto('s35',{push:false});},800);
+    })();
   }
   function goBack(){const p=history.pop();if(p)goto(p.id,{push:false,scroll:p.scroll});else message('이전 화면이 없습니다. 화면 목록으로 이동할 수 있어요.');}
   function hotspot(h,offset=0){const b=document.createElement('button');b.type='button';b.className='hotspot';b.setAttribute('aria-label',h.label);b.title=h.label;if(h.action==='condition')b.setAttribute('aria-pressed',String(state.conditions.includes(h.value)));if(h.action==='med')b.setAttribute('aria-pressed',String(state.meds[h.value]));if(h.action==='meal')b.setAttribute('aria-pressed',String(state.meals[h.value]));b.dataset.action=h.action;if(h.value!==undefined)b.dataset.value=String(h.value);const [x,y,w,ht]=h.rect;b.style.cssText=`left:${x}px;top:${y-offset}px;width:${w}px;height:${ht}px`;if(h.action==='day')b.setAttribute('aria-pressed',String(state.selectedDate==='2026-11-'+String(h.value).padStart(2,'0')));b.addEventListener('click',()=>act(h));return b;}
